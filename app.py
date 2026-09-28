@@ -436,32 +436,58 @@ with tab_cfg:
         except md.PackageNotFoundError:
             return None
 
-    def chromium_status() -> tuple[bool, str]:
+    @st.cache_data(ttl=900, show_spinner="Testing the headless browser…")
+    def chromium_status() -> tuple[str, str, str]:
+        """Really start Chromium: ("ok" | "fallback", short message, full diagnostic)."""
+        os_name = ""
+        try:
+            os_name = next((line.split("=", 1)[1].strip().strip('"') for line in
+                            Path("/etc/os-release").read_text().splitlines() if line.startswith("PRETTY_NAME=")), "")
+        except OSError:
+            pass
+        installed = ensure_browser()
         try:
             from playwright.sync_api import sync_playwright
             with sync_playwright() as p:
-                path = Path(p.chromium.executable_path)
-            return path.exists(), str(path) if path.exists() else "Run: playwright install chromium"
+                p.chromium.launch(headless=True).close()
+            return "ok", "Chromium starts correctly (full page reader).", ""
         except Exception as exc:
-            return False, str(exc)
+            reason = str(exc).strip()
+            first = next((ln for ln in reason.splitlines() if ln.strip()), reason)[:160]
+            diag = f"OS: {os_name or sys.platform}\nPython: {sys.version.split()[0]}\n" \
+                   f"Browser download ok: {installed}\n\n{reason[:3000]}"
+            return "fallback", f"Chromium can't start on this server ({first}).", diag
 
     pw_ver, pdf_ver, genai_ver = version("playwright"), version("pypdf"), version("google-genai")
-    chrome_ok, chrome_detail = chromium_status()
+    chrome_state, chrome_detail, chrome_diag = chromium_status() if pw_ver else ("missing", "Not installed", "")
 
-
+    # state: "ok" (green), "fallback" (amber – works in reduced mode), anything else (red)
     checks = [
-        ("Playwright", bool(pw_ver) and chrome_ok, f"v{pw_ver} · Chromium: {chrome_detail}" if pw_ver else "Not installed"),
-        ("PyPDF", bool(pdf_ver), f"v{pdf_ver}" if pdf_ver else "Not installed"),
-        ("Gemini API", bool(genai_ver) and key_ok,
+        ("Playwright", chrome_state, f"v{pw_ver} · {chrome_detail}" if pw_ver else "Not installed"),
+        ("PyPDF", "ok" if pdf_ver else "missing", f"v{pdf_ver}" if pdf_ver else "Not installed"),
+        ("Gemini API", "ok" if genai_ver and key_ok else "missing",
          f"google-genai v{genai_ver} · key {'ready' if key_ok else 'missing — enter it in the sidebar'}" if genai_ver else "google-genai not installed"),
     ]
+    icons = {"ok": ("🟢", "**Operational**"),
+             "fallback": ("🟡", "**Working in basic mode:** pages are read without a browser")}
     cols = st.columns(3)
-    for col, (name, ok, detail) in zip(cols, checks):
+    for col, (name, state, detail) in zip(cols, checks):
+        icon, label = icons.get(state, ("🔴", "**Action required**"))
         with col:
             with st.container(border=True):
-                st.markdown(f"### {'🟢' if ok else '🔴'} {name}")
+                st.markdown(f"### {icon} {name}")
                 st.caption(detail)
-                st.markdown("**Operational**" if ok else "**Action required**")
+                st.markdown(label)
+
+    if chrome_state == "fallback":
+        st.info("Searches still work: PDFs and most university pages are read with the built-in plain page "
+                "reader. Only JavaScript-heavy job boards give less text. To enable the full browser on this "
+                "host, send the diagnostic below to the app maintainer.")
+        with st.expander("Browser diagnostic"):
+            st.code(chrome_diag, language="text")
+            if st.button("Re-test browser"):
+                chromium_status.clear()
+                st.rerun()
 
     if st.button("Ping Gemini (live test)", disabled=not key_ok):
         try:
