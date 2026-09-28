@@ -212,7 +212,7 @@ This uses [Streamlit Community Cloud](https://share.streamlit.io), which is free
 - **Visitors** paste their own free Gemini key, so your quota is never used by others.
 - **You** type your `APP_PASSWORD` in the sidebar to use your own key.
 - Uploaded CVs are kept per browser session and are never written to the server.
-- If the host cannot run the Chromium browser, the app automatically falls back to plain page reading. PDFs and most university pages still work.
+- `packages.txt` installs the Linux libraries Chromium needs on Streamlit Cloud (Debian 13). If the host still cannot run the browser, the app falls back to plain page reading, so PDFs and most university pages still work. **⚙️ System Configuration** shows which mode is active.
 
 ---
 
@@ -240,6 +240,7 @@ This uses [Streamlit Community Cloud](https://share.streamlit.io), which is free
 | `system_prompt.txt` | The agent's rules (authenticity, visa tags, zero-hallucination tailoring, JSON schema) |
 | `setup.bat` / `setup.sh`, `start.bat` / `start.sh` | One-click install and launch |
 | `.env.example`, `.streamlit/secrets.toml.example` | Configuration templates |
+| `packages.txt` | Linux system libraries for Chromium on Streamlit Cloud (Debian 13) |
 
 **Main rules the AI follows:**
 - **Dual-track search:** Academic or Industry, with local terminology for each country and level.
