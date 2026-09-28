@@ -1,0 +1,6 @@
+[browser]
+gatherUsageStats = false
+
+[server]
+# Skips Streamlit's first-run email prompt; start.bat / start.sh open the browser instead
+headless = true

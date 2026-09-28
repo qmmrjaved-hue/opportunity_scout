@@ -1,0 +1,25 @@
+JANE DOE
+Email: jane.doe@example.com | Location: Lahore, Pakistan
+
+PROFESSIONAL SUMMARY
+Computational researcher with an MSc in Computer Science focused on machine learning for medical imaging.
+
+EDUCATION
+MSc Computer Science, Example University (2022-2024) - Thesis: "Deep learning segmentation of retinal OCT scans"
+BSc Software Engineering, Example Institute of Technology (2018-2022)
+
+EXPERIENCE
+Research Assistant, Medical Imaging Lab, Example University (2023-2024)
+- Trained U-Net and Vision Transformer models in PyTorch on 12,000 OCT images, improving Dice score from 0.81 to 0.87.
+- Built data preprocessing pipelines in Python (NumPy, pandas, OpenCV).
+- Co-authored one conference paper presented at a national AI symposium.
+
+Junior Data Analyst, Example Health Tech (2022-2023)
+- Automated weekly reporting with SQL and Python, reducing manual effort by 6 hours per week.
+- Built dashboards in Power BI for clinical operations teams.
+
+SKILLS
+Python, PyTorch, scikit-learn, NumPy, pandas, OpenCV, SQL, Git, Linux, Power BI, LaTeX
+
+LANGUAGES
+English (C1, IELTS 7.5), Urdu (native)
