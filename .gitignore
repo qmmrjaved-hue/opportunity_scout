@@ -6,3 +6,6 @@ __pycache__/
 # Personal CVs never leave your computer; only the sample is shared
 candidates/*
 !candidates/sample_candidate.txt
+
+# Streamlit secrets (online deployments keep them in the host settings)
+.streamlit/secrets.toml

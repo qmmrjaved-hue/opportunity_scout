@@ -6,15 +6,19 @@ Run with:  streamlit run app.py
 
 from __future__ import annotations
 
+import hmac
 import importlib.metadata as md
 import io
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
-from agent import OpportunityScoutAgent, api_key_configured
+from agent import PLACEHOLDER_KEY, OpportunityScoutAgent
 from discovery import ACADEMIC_LEVELS, SearchProfile, discover, estimated_calls, evaluate_documents
 from parser import FetchedDoc, extract_pdf_text, run_scrape
 
@@ -58,13 +62,59 @@ st.session_state.setdefault("stats", None)
 st.session_state.setdefault("tailor_result", None)
 
 
+st.session_state.setdefault("my_cvs", {})
+
+
+def _setting(name: str) -> str:
+    """Read a setting from Streamlit secrets (cloud) or environment/.env (local)."""
+    try:
+        if name in st.secrets:
+            return str(st.secrets[name]).strip()
+    except Exception:
+        pass  # no secrets file when running locally
+    return os.getenv(name, "").strip()
+
+
+# PUBLIC_MODE (set in the host's secrets) = shared online deployment: visitors bring their own key,
+# CVs stay in the visitor's session, and the owner's key needs APP_PASSWORD.
+PUBLIC_MODE = _setting("PUBLIC_MODE").lower() in ("1", "true", "yes")
+OWNER_KEY = "" if _setting("GEMINI_API_KEY") == PLACEHOLDER_KEY else _setting("GEMINI_API_KEY")
+APP_PASSWORD = _setting("APP_PASSWORD")
+
+
 @st.cache_resource(show_spinner=False)
-def get_agent() -> OpportunityScoutAgent:
-    return OpportunityScoutAgent()
+def get_agent(api_key: str) -> OpportunityScoutAgent:
+    return OpportunityScoutAgent(api_key=api_key)
 
 
-def list_candidates() -> dict[str, Path]:
-    return {p.stem.replace("_", " ").title(): p for p in sorted(CANDIDATES_DIR.glob("*.txt"))}
+@st.cache_resource(show_spinner="Preparing the web page reader (first run only, about 1 minute)…")
+def ensure_browser() -> bool:
+    """Install Playwright's Chromium on hosts where setup.bat was never run (e.g. Streamlit Cloud).
+    If it still cannot run, parser.py falls back to plain HTTP page reading."""
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            if Path(p.chromium.executable_path).exists():
+                return True
+    except Exception:
+        pass
+    try:
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"],
+                       check=True, timeout=300, capture_output=True)
+        return True
+    except Exception:
+        return False
+
+
+def list_candidates() -> dict[str, str]:
+    """Candidate name -> CV text. Online, only the sample plus this visitor's own uploads are visible."""
+    found = {}
+    for p in sorted(CANDIDATES_DIR.glob("*.txt")):
+        if PUBLIC_MODE and p.name != "sample_candidate.txt":
+            continue
+        found[p.stem.replace("_", " ").title()] = p.read_text(encoding="utf-8")
+    found.update(st.session_state.my_cvs)
+    return found
 
 
 # --------------------------------------------------------------------------- #
@@ -98,17 +148,38 @@ with st.sidebar:
                 cv_text = extract_pdf_text(uploaded.getvalue())
             else:
                 cv_text = uploaded.getvalue().decode("utf-8", errors="ignore")
-            slug = "".join(c if c.isalnum() else "_" for c in new_name.strip().lower())
-            (CANDIDATES_DIR / f"{slug}.txt").write_text(cv_text, encoding="utf-8")
+            if PUBLIC_MODE:
+                # Kept only in this browser session; never written to the shared server
+                st.session_state.my_cvs[new_name.strip()] = cv_text
+            else:
+                slug = "".join(c if c.isalnum() else "_" for c in new_name.strip().lower())
+                (CANDIDATES_DIR / f"{slug}.txt").write_text(cv_text, encoding="utf-8")
             st.success(f"Saved {new_name}.")
             st.rerun()
+        if PUBLIC_MODE:
+            st.caption("🔒 Your CV stays in this browser session only and is not stored on the server.")
     elif candidate_name in candidates:
-        master_cv_default = candidates[candidate_name].read_text(encoding="utf-8")
+        master_cv_default = candidates[candidate_name]
 
     st.divider()
-    st.markdown(
-        f"**Gemini:** {'🟢 key loaded' if api_key_configured() else '🔴 set GEMINI_API_KEY in .env'}"
-    )
+    if OWNER_KEY and not PUBLIC_MODE:
+        active_key = OWNER_KEY
+        st.markdown("**Gemini:** 🟢 key loaded from `.env`")
+    else:
+        with st.expander("🔑 Gemini API key", expanded=True):
+            user_key = st.text_input("Your Gemini API key", type="password",
+                                     help="Free key: https://aistudio.google.com/apikey — used only for your "
+                                          "session and never stored.")
+            st.caption("[Get a free key →](https://aistudio.google.com/apikey)")
+            unlocked = False
+            if OWNER_KEY and APP_PASSWORD:
+                owner_pw = st.text_input("…or owner password", type="password")
+                unlocked = bool(owner_pw) and hmac.compare_digest(owner_pw, APP_PASSWORD)
+                if owner_pw and not unlocked:
+                    st.error("Wrong password.")
+            active_key = user_key.strip() or (OWNER_KEY if unlocked else "")
+        st.markdown(f"**Gemini:** {'🟢 ready' if active_key else '🔴 enter an API key above'}")
+    key_ok = bool(active_key)
 
 profile = SearchProfile(domain=domain_field.strip(), skills=skills.strip(), cv=master_cv_default,
                         country=target_country, track=career_track, levels=position_levels)
@@ -137,13 +208,17 @@ with tab_dash:
             st.caption(f"≈ {estimated_calls(n_rounds, max_eval)} Gemini calls "
                        "(free tier: ~20/day per model, with automatic model fallback)")
             run_auto = st.button("🚀 Find matching positions", type="primary", width="stretch",
-                                 disabled=not (api_key_configured() and has_profile))
+                                 disabled=not (key_ok and has_profile))
         if not has_profile:
             st.info("Enter a **Domain Field**, **Key Skills**, or select a **Candidate CV** in the sidebar.")
+        if not key_ok:
+            st.warning("🔑 Enter your Gemini API key in the sidebar to start "
+                       "([get one free](https://aistudio.google.com/apikey)).")
         if run_auto:
             bar = st.progress(0.0, text="Starting…")
             try:
-                result = discover(get_agent(), profile, n_rounds=n_rounds, max_evaluate=max_eval,
+                ensure_browser()
+                result = discover(get_agent(active_key), profile, n_rounds=n_rounds, max_evaluate=max_eval,
                                   progress=lambda f, msg: bar.progress(min(1.0, f), text=msg))
                 st.session_state.positions = result["rows"]
                 st.session_state.plan = result["plan"]
@@ -162,15 +237,16 @@ with tab_dash:
             )
         with col_opts:
             max_pdfs = st.number_input("Max PDFs per portal", 1, 50, 10)
-            use_gemini = st.toggle("Score with Gemini", value=api_key_configured(),
-                                   disabled=not api_key_configured())
+            use_gemini = st.toggle("Score with Gemini", value=key_ok,
+                                   disabled=not key_ok)
         if st.button("🔎 Run Scout", type="primary", disabled=not portal_urls.strip()):
             with st.spinner("Loading portals in headless Chromium and parsing PDFs…"):
+                ensure_browser()
                 calls = run_scrape(portal_urls.splitlines(), int(max_pdfs))
             docs = [(FetchedDoc(url=c.pdf_url, final_url=c.pdf_url, kind="pdf", title=c.title, text=c.text,
                                 pdf_urls=[c.pdf_url], error=c.error), {}) for c in calls]
             bar = st.progress(0.0, text="Scoring…")
-            rows = evaluate_documents(get_agent() if use_gemini else None, docs, profile,
+            rows = evaluate_documents(get_agent(active_key) if use_gemini else None, docs, profile,
                                       progress=lambda f, msg: bar.progress(f, text=msg))
             bar.empty()
             st.session_state.positions, st.session_state.plan, st.session_state.stats = rows, None, None
@@ -294,10 +370,10 @@ with tab_cv:
     job_text = c2.text_area("Job Call Text", height=380, key="job_text")
 
     if st.button("✨ Evaluate & Tailor", type="primary",
-                 disabled=not (api_key_configured() and master_cv.strip() and job_text.strip())):
+                 disabled=not (key_ok and master_cv.strip() and job_text.strip())):
         with st.spinner("Gemini is evaluating the call and tailoring your CV…"):
             try:
-                st.session_state.tailor_result = get_agent().evaluate_and_tailor(
+                st.session_state.tailor_result = get_agent(active_key).evaluate_and_tailor(
                     job_text, master_cv,
                     target_country=profile.region, domain_field=domain_field,
                     career_track=career_track + (f" — applying at level: {', '.join(profile.target_levels)}"
@@ -306,8 +382,8 @@ with tab_cv:
             except Exception as exc:
                 st.session_state.tailor_result = None
                 st.error(f"Evaluation failed: {exc}")
-    if not api_key_configured():
-        st.warning("Set GEMINI_API_KEY in `.env` and restart the app to enable tailoring.")
+    if not key_ok:
+        st.warning("Enter a Gemini API key in the sidebar (🔑) to enable tailoring.")
 
     res = st.session_state.tailor_result
     if res:
@@ -371,13 +447,13 @@ with tab_cfg:
 
     pw_ver, pdf_ver, genai_ver = version("playwright"), version("pypdf"), version("google-genai")
     chrome_ok, chrome_detail = chromium_status()
-    key_ok = api_key_configured()
+
 
     checks = [
         ("Playwright", bool(pw_ver) and chrome_ok, f"v{pw_ver} · Chromium: {chrome_detail}" if pw_ver else "Not installed"),
         ("PyPDF", bool(pdf_ver), f"v{pdf_ver}" if pdf_ver else "Not installed"),
         ("Gemini API", bool(genai_ver) and key_ok,
-         f"google-genai v{genai_ver} · key {'loaded' if key_ok else 'missing — edit .env'}" if genai_ver else "google-genai not installed"),
+         f"google-genai v{genai_ver} · key {'ready' if key_ok else 'missing — enter it in the sidebar'}" if genai_ver else "google-genai not installed"),
     ]
     cols = st.columns(3)
     for col, (name, ok, detail) in zip(cols, checks):
@@ -389,7 +465,7 @@ with tab_cfg:
 
     if st.button("Ping Gemini (live test)", disabled=not key_ok):
         try:
-            st.success(f"Gemini responded: {get_agent().ping()}")
+            st.success(f"Gemini responded: {get_agent(active_key).ping()}")
         except Exception as exc:
             st.error(f"Gemini ping failed: {exc}")
 

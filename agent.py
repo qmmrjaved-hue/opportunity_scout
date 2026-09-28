@@ -6,6 +6,7 @@ Wraps google-genai with the OpportunityScout system prompt and strict JSON outpu
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -41,7 +42,8 @@ FALLBACK_MODELS = ["gemini-flash-latest", "gemini-flash-lite-latest"]
 # analysis (screening, tailoring) prefers the other models to leave that quota for searching.
 SEARCH_MODELS = [DEFAULT_MODEL, "gemini-flash-latest"]
 ANALYSIS_MODELS = ["gemini-flash-latest", DEFAULT_MODEL, "gemini-flash-lite-latest"]
-_exhausted_models: dict[str, date] = {}
+# Keyed by (API-key fingerprint, model): quotas belong to each key, and several users may share one server
+_exhausted_models: dict[tuple[str, str], date] = {}
 
 
 class QuotaExhaustedError(RuntimeError):
@@ -76,6 +78,7 @@ class OpportunityScoutAgent:
         if not api_key or api_key == PLACEHOLDER_KEY:
             raise ValueError("GEMINI_API_KEY is not set. Add your key to the .env file.")
         self.client = genai.Client(api_key=api_key)
+        self._key_id = hashlib.sha256(api_key.encode()).hexdigest()[:16]
         self.model = model
         self.last_model: str | None = None
         self.system_instruction = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
@@ -96,7 +99,7 @@ class OpportunityScoutAgent:
         """
         models = models or [self.model] + [m for m in FALLBACK_MODELS if m != self.model]
         for model in models:
-            if _exhausted_models.get(model) == date.today():
+            if _exhausted_models.get((self._key_id, model)) == date.today():
                 continue
             for attempt in range(attempts):
                 try:
@@ -107,7 +110,7 @@ class OpportunityScoutAgent:
                     message = str(exc)
                     hinted = re.search(r"retry in ([\d.]+)s", message)
                     if exc.code == 429 and "PerDay" in message:
-                        _exhausted_models[model] = date.today()
+                        _exhausted_models[(self._key_id, model)] = date.today()
                         break  # daily quota gone: next model
                     if exc.code == 404 or (exc.code == 429 and not hinted):
                         break  # model (or this feature) unavailable for this key: next model

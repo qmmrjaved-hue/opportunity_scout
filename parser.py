@@ -18,6 +18,7 @@ import logging
 import re
 import sys
 from dataclasses import asdict, dataclass, field
+from html.parser import HTMLParser
 from datetime import datetime
 from typing import Iterable
 from urllib.parse import urljoin, urlparse
@@ -33,6 +34,7 @@ REQUEST_TIMEOUT = 20
 # pypdf logs harmless warnings about malformed PDFs; keep the console readable
 logging.getLogger("pypdf").setLevel(logging.ERROR)
 MAX_PDF_BYTES = 25 * 1024 * 1024
+MAX_PAGE_CHARS = 40_000
 
 # --------------------------------------------------------------------------- #
 # Authenticity heuristics
@@ -281,6 +283,73 @@ def download_pdf(url: str) -> bytes:
 
 
 # --------------------------------------------------------------------------- #
+# Plain-HTTP fallback (used when Chromium cannot run, e.g. on some cloud hosts)
+# --------------------------------------------------------------------------- #
+class _PageParser(HTMLParser):
+    """Collects visible text, the <title> and <a href> links from an HTML page."""
+    SKIP = {"script", "style", "noscript", "svg", "head"}
+    BLOCKS = {"p", "div", "li", "br", "tr", "h1", "h2", "h3", "h4", "section", "article"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.title = ""
+        self.anchors: list[list[str]] = []
+        self._skip = 0
+        self._in_title = False
+        self._link: list[str] | None = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP:
+            self._skip += 1
+        if tag == "title":
+            self._in_title = True
+        if tag == "a":
+            self._link = [dict(attrs).get("href") or "", ""]
+        if tag in self.BLOCKS:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP and self._skip:
+            self._skip -= 1
+        if tag == "title":
+            self._in_title = False
+        if tag == "a" and self._link is not None:
+            self.anchors.append([self._link[0], self._link[1].strip()])
+            self._link = None
+
+    def handle_data(self, data):
+        if self._in_title:
+            self.title += data
+        if self._skip:
+            return
+        self.parts.append(data)
+        if self._link is not None:
+            self._link[1] += data
+
+    def text(self) -> str:
+        joined = re.sub(r"\n\s*\n+", "\n\n", "".join(self.parts))
+        return re.sub(r"[ \t]+", " ", joined).strip()
+
+
+def http_page(url: str) -> tuple[int, str, str, str, list[list[str]]]:
+    """Fetch an HTML page without a browser: (status, final_url, title, text, anchors)."""
+    resp = requests.get(url, headers={"User-Agent": USER_AGENT, "Accept-Language": "en;q=0.9,*;q=0.5"},
+                        timeout=REQUEST_TIMEOUT, allow_redirects=True)
+    parser = _PageParser()
+    if resp.ok and "html" in resp.headers.get("content-type", "html").lower():
+        parser.feed(resp.text[:2_000_000])
+    return resp.status_code, resp.url, parser.title.strip(), parser.text()[:MAX_PAGE_CHARS], parser.anchors
+
+
+async def _launch_browser(p):
+    """Launch headless Chromium, or return None when it is unavailable on this machine."""
+    try:
+        return await p.chromium.launch(headless=True)
+    except Exception:
+        return None
+
+# --------------------------------------------------------------------------- #
 # Playwright scraping
 # --------------------------------------------------------------------------- #
 async def find_pdf_links(page_url: str, timeout_ms: int = 45000) -> list[tuple[str, str]]:
@@ -288,21 +357,24 @@ async def find_pdf_links(page_url: str, timeout_ms: int = 45000) -> list[tuple[s
     from playwright.async_api import async_playwright
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        try:
-            context = await browser.new_context(user_agent=USER_AGENT)
-            page = await context.new_page()
-            await page.goto(page_url, wait_until="domcontentloaded", timeout=timeout_ms)
+        browser = await _launch_browser(p)
+        if browser is None:
+            _, page_url, _, _, anchors = await asyncio.to_thread(http_page, page_url)
+        else:
             try:
-                await page.wait_for_load_state("networkidle", timeout=15000)
-            except Exception:
-                pass  # some portals never go idle; DOM content is enough
-            anchors = await page.eval_on_selector_all(
-                "a[href]",
-                "els => els.map(e => [e.getAttribute('href'), (e.innerText || e.title || '').trim()])",
-            )
-        finally:
-            await browser.close()
+                context = await browser.new_context(user_agent=USER_AGENT)
+                page = await context.new_page()
+                await page.goto(page_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=15000)
+                except Exception:
+                    pass  # some portals never go idle; DOM content is enough
+                anchors = await page.eval_on_selector_all(
+                    "a[href]",
+                    "els => els.map(e => [e.getAttribute('href'), (e.innerText || e.title || '').trim()])",
+                )
+            finally:
+                await browser.close()
 
     links, seen = [], set()
     for href, text in anchors:
@@ -371,7 +443,6 @@ CALL_LINK_HINTS = re.compile(
     r"description|advert",
     re.I,
 )
-MAX_PAGE_CHARS = 40_000
 
 
 @dataclass
@@ -415,30 +486,41 @@ async def _fetch_one(browser, url: str, sem: asyncio.Semaphore, max_pdfs: int) -
         except Exception:
             pass  # fall through to the browser; some sites block plain HTTP clients
 
-        # 2) HTML page rendered in headless Chromium
-        context = await browser.new_context(user_agent=USER_AGENT)
-        try:
-            page = await context.new_page()
-            response = await page.goto(doc.final_url or url, wait_until="domcontentloaded", timeout=25000)
-            if response and response.status >= 400:
-                doc.error = f"HTTP {response.status}"
-                return doc
+        # 2) HTML page: rendered in headless Chromium, or plain HTTP when no browser is available
+        if browser is None:
             try:
-                await page.wait_for_load_state("networkidle", timeout=5000)
-            except Exception:
-                pass
-            doc.final_url = page.url
-            doc.title = (await page.title()) or doc.final_url
-            doc.text = (await page.inner_text("body"))[:MAX_PAGE_CHARS]
-            anchors = await page.eval_on_selector_all(
-                "a[href]",
-                "els => els.map(e => [e.getAttribute('href'), (e.innerText || e.title || '').trim()])",
-            )
-        except Exception as exc:
-            doc.error = f"{type(exc).__name__}: {exc}"
-            return doc
-        finally:
-            await context.close()
+                status, doc.final_url, doc.title, doc.text, anchors = await asyncio.to_thread(http_page, url)
+            except Exception as exc:
+                doc.error = f"{type(exc).__name__}: {exc}"
+                return doc
+            if status >= 400:
+                doc.error = f"HTTP {status}"
+                return doc
+            doc.title = doc.title or doc.final_url
+        else:
+            context = await browser.new_context(user_agent=USER_AGENT)
+            try:
+                page = await context.new_page()
+                response = await page.goto(doc.final_url or url, wait_until="domcontentloaded", timeout=25000)
+                if response and response.status >= 400:
+                    doc.error = f"HTTP {response.status}"
+                    return doc
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
+                    pass
+                doc.final_url = page.url
+                doc.title = (await page.title()) or doc.final_url
+                doc.text = (await page.inner_text("body"))[:MAX_PAGE_CHARS]
+                anchors = await page.eval_on_selector_all(
+                    "a[href]",
+                    "els => els.map(e => [e.getAttribute('href'), (e.innerText || e.title || '').trim()])",
+                )
+            except Exception as exc:
+                doc.error = f"{type(exc).__name__}: {exc}"
+                return doc
+            finally:
+                await context.close()
 
     # 3) Attach call PDFs linked from the page
     pdf_links = []
@@ -463,7 +545,7 @@ async def _fetch_one(browser, url: str, sem: asyncio.Semaphore, max_pdfs: int) -
 
 async def fetch_documents(urls: Iterable[str], max_pdfs_per_page: int = 2,
                           concurrency: int = 6) -> list[FetchedDoc]:
-    """Fetch pages/PDFs with one shared headless browser."""
+    """Fetch pages/PDFs with one shared headless browser (plain HTTP if Chromium is unavailable)."""
     from playwright.async_api import async_playwright
 
     urls = list(dict.fromkeys(u for u in urls if u))
@@ -471,11 +553,12 @@ async def fetch_documents(urls: Iterable[str], max_pdfs_per_page: int = 2,
         return []
     sem = asyncio.Semaphore(concurrency)
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await _launch_browser(p)
         try:
             return list(await asyncio.gather(*(_fetch_one(browser, u, sem, max_pdfs_per_page) for u in urls)))
         finally:
-            await browser.close()
+            if browser is not None:
+                await browser.close()
 
 
 if __name__ == "__main__":
